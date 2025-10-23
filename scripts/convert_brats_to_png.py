@@ -301,7 +301,22 @@ def main():
     # 获取所有患者 ID
     if not os.path.exists(args.input_dir):
         logger.error(f"输入目录不存在: {args.input_dir}")
-        print(f"错误: 输入目录不存在 - {args.input_dir}")
+        print("\n" + "=" * 60)
+        print("❌ 错误: 输入目录不存在")
+        print("=" * 60)
+        print(f"指定的目录: {args.input_dir}")
+        print(f"绝对路径: {os.path.abspath(args.input_dir)}")
+        print("\n请确保:")
+        print("  1. 已下载 BraTS2021 数据集")
+        print("  2. 数据已解压到正确位置")
+        print("  3. 目录结构如下:")
+        print("     data/")
+        print("     └── BraTS2021/")
+        print("         ├── BraTS2021_00000/")
+        print("         ├── BraTS2021_00001/")
+        print("         └── ...")
+        print("\n如需帮助，请参考: docs/DATA_PREPARATION.md")
+        print("=" * 60)
         return
     
     all_folders = os.listdir(args.input_dir)
@@ -309,18 +324,70 @@ def main():
     
     if len(patients) == 0:
         logger.warning(f"在 {args.input_dir} 中未找到任何 BraTS2021 患者数据")
-        print(f"警告: 在 {args.input_dir} 中未找到任何 BraTS2021 患者数据")
+        print("\n" + "=" * 60)
+        print("⚠️  警告: 未找到 BraTS2021 患者数据")
+        print("=" * 60)
+        print(f"搜索目录: {args.input_dir}")
+        print(f"绝对路径: {os.path.abspath(args.input_dir)}")
+        print(f"\n目录内容:")
+        if all_folders:
+            for folder in all_folders[:10]:  # 只显示前10个
+                print(f"  - {folder}")
+            if len(all_folders) > 10:
+                print(f"  ... 还有 {len(all_folders) - 10} 个文件/文件夹")
+        else:
+            print("  (目录为空)")
+        print("\n请确保:")
+        print("  1. 患者文件夹名称包含 'BraTS2021'")
+        print("  2. 每个患者文件夹包含以下文件:")
+        print("     - {patient_id}_flair.nii.gz")
+        print("     - {patient_id}_t1.nii.gz")
+        print("     - {patient_id}_t1ce.nii.gz")
+        print("     - {patient_id}_t2.nii.gz")
+        print("     - {patient_id}_seg.nii.gz")
+        print("\n如需帮助，请参考: docs/DATA_PREPARATION.md")
+        print("=" * 60)
         return
     
     logger.info(f"找到 {len(patients)} 个患者数据")
     logger.info(f"输入目录: {args.input_dir}")
     logger.info(f"最小肿瘤像素数阈值: {args.min_tumor_pixels}")
     
-    print(f"找到 {len(patients)} 个患者数据")
+    print("\n" + "=" * 60)
+    print("✓ 数据检查通过")
+    print("=" * 60)
+    print(f"找到患者数: {len(patients)}")
     print(f"输入目录: {args.input_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"最小肿瘤像素数: {args.min_tumor_pixels}")
-    print(f"日志文件: {args.log_dir}")
+    print(f"日志目录: {args.log_dir}")
+    
+    # 验证第一个患者的数据完整性
+    print("\n正在验证数据完整性...")
+    first_patient = patients[0]
+    first_patient_path = os.path.join(args.input_dir, first_patient)
+    required_files = [
+        f"{first_patient}_flair.nii.gz",
+        f"{first_patient}_t1.nii.gz",
+        f"{first_patient}_t1ce.nii.gz",
+        f"{first_patient}_t2.nii.gz",
+        f"{first_patient}_seg.nii.gz"
+    ]
+    
+    missing_files = []
+    for file in required_files:
+        if not os.path.exists(os.path.join(first_patient_path, file)):
+            missing_files.append(file)
+    
+    if missing_files:
+        print(f"\n❌ 错误: 患者 {first_patient} 缺少以下文件:")
+        for file in missing_files:
+            print(f"  - {file}")
+        print("\n请检查数据完整性后重试。")
+        logger.error(f"患者 {first_patient} 数据不完整，缺少文件: {missing_files}")
+        return
+    
+    print(f"✓ 数据完整性验证通过 (检查了 {first_patient})")
     print("-" * 60)
     
     # 批量处理所有患者
