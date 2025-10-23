@@ -362,6 +362,7 @@ def get_training_augmentation(image_size=(240, 240)):
         - 所有变换同时应用于图像和标签
         - 使用 border_mode=cv2.BORDER_CONSTANT 避免边界伪影
         - 插值方法：图像用双线性，标签用最近邻
+        - CLAHE 已移除（不支持 4 通道图像）
     """
     try:
         import albumentations as A
@@ -448,12 +449,13 @@ def get_training_augmentation(image_size=(240, 240)):
         ),
         
         # CLAHE（对比度受限自适应直方图均衡）
-        # 增强局部对比度，突出细节
-        A.CLAHE(
-            clip_limit=2.0,    # 对比度限制
-            tile_grid_size=(8, 8),  # 网格大小
-            p=0.3
-        ),
+        # 注意：CLAHE 只支持 1/3 通道，BraTS 是 4 通道，所以跳过
+        # 如需使用，需要对每个通道单独应用
+        # A.CLAHE(
+        #     clip_limit=2.0,
+        #     tile_grid_size=(8, 8),
+        #     p=0.3
+        # ),
         
         # ========== 4. 噪声和模糊 ==========
         
@@ -582,7 +584,8 @@ def get_heavy_augmentation():
         # 更强的光学变换
         A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
         A.RandomGamma(gamma_limit=(70, 130), p=0.7),
-        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
+        # CLAHE 不支持 4 通道图像，已移除
+        # A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
         
         # 更多噪声
         A.GaussNoise(var_limit=(10.0, 100.0), p=0.5),
