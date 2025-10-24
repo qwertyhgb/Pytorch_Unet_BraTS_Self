@@ -65,7 +65,7 @@ def parse_args():
                         help="初始学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="权重衰减（L2 正则化）")
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--num_workers", type=int, default=2,
                         help="数据加载线程数")
     
     # 损失函数相关
