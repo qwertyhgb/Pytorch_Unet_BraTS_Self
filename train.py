@@ -67,6 +67,12 @@ def parse_args():
                         help="权重衰减（L2 正则化）")
     parser.add_argument("--num_workers", type=int, default=2,
                         help="数据加载线程数")
+    parser.add_argument("--mixed_precision", action="store_true",
+                        help="使用混合精度训练（FP16）加速")
+    parser.add_argument("--compile_model", action="store_true",
+                        help="使用 torch.compile 编译模型（PyTorch 2.0+）")
+    parser.add_argument("--gradient_accumulation", type=int, default=1,
+                        help="梯度累积步数（模拟更大的 batch size）")
     
     # 损失函数相关
     parser.add_argument("--use_class_weights", action="store_true",
@@ -128,7 +134,7 @@ def set_seed(seed):
 
 def dice_score(pred, target, num_classes=4, eps=1e-5):
     """
-    计算 Dice Score（针对多类别分割）
+    计算 Dice Score（针对多类别分割）- 优化版本
     
     Dice Score 是医学图像分割中常用的评估指标，衡量预测和真实标签的重叠程度
     公式：Dice = 2 * |X ∩ Y| / (|X| + |Y|)
@@ -145,23 +151,16 @@ def dice_score(pred, target, num_classes=4, eps=1e-5):
     # 将 logits 转换为类别预测
     pred = torch.argmax(pred, dim=1)  # [B, H, W]
     
+    # 向量化计算所有类别的 Dice Score
     dice_scores = []
-    
-    # 遍历每个肿瘤类别（跳过背景类 0）
     for c in range(1, num_classes):
-        # 生成二值掩码
-        pred_c = (pred == c).float()  # [B, H, W]
-        target_c = (target == c).float()  # [B, H, W]
-        
-        # 计算交集和并集
-        intersection = (pred_c * target_c).sum()
-        union = pred_c.sum() + target_c.sum()
-        
-        # 计算 Dice Score
+        pred_c = (pred == c)
+        target_c = (target == c)
+        intersection = (pred_c & target_c).sum().float()
+        union = pred_c.sum().float() + target_c.sum().float()
         dice = (2.0 * intersection + eps) / (union + eps)
         dice_scores.append(dice.item())
     
-    # 返回平均 Dice Score
     return sum(dice_scores) / len(dice_scores)
 
 
@@ -261,9 +260,9 @@ def load_checkpoint(model, optimizer, checkpoint_path, scheduler=None):
 
 # ==================== 训练和验证函数 ====================
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args):
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args, scaler=None):
     """
-    训练一个 epoch
+    训练一个 epoch（优化版本）
     
     Args:
         model (nn.Module): 模型
@@ -273,6 +272,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, ar
         device (torch.device): 设备
         epoch (int): 当前轮数
         args (Namespace): 训练参数
+        scaler (GradScaler, optional): 混合精度训练的梯度缩放器
     
     Returns:
         tuple: (平均损失, 平均 Dice Score)
@@ -286,40 +286,64 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, ar
     # 使用 tqdm 显示进度条
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [训练]")
     
+    optimizer.zero_grad()  # 在循环外初始化
+    
     for batch_idx, (images, masks) in enumerate(pbar):
-        # 将数据移到设备
-        images = images.to(device)  # [B, 4, H, W]
-        masks = masks.to(device)    # [B, H, W]
+        # 将数据移到设备（non_blocking 加速）
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
         
-        # 前向传播
-        outputs = model(images)  # [B, 4, H, W]
-        
-        # 计算损失
-        ce_loss = criterion(outputs, masks)
-        
-        # 可选：添加 Dice Loss
-        if args.dice_weight > 0:
-            d_loss = dice_loss(outputs, masks, num_classes=args.num_classes)
-            loss = ce_loss + args.dice_weight * d_loss
+        # 混合精度训练
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                ce_loss = criterion(outputs, masks)
+                
+                if args.dice_weight > 0:
+                    d_loss = dice_loss(outputs, masks, num_classes=args.num_classes)
+                    loss = ce_loss + args.dice_weight * d_loss
+                else:
+                    loss = ce_loss
+                
+                # 梯度累积
+                loss = loss / args.gradient_accumulation
+            
+            scaler.scale(loss).backward()
+            
+            # 每 N 步更新一次参数
+            if (batch_idx + 1) % args.gradient_accumulation == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
         else:
-            loss = ce_loss
-        
-        # 反向传播和优化
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # 标准训练
+            outputs = model(images)
+            ce_loss = criterion(outputs, masks)
+            
+            if args.dice_weight > 0:
+                d_loss = dice_loss(outputs, masks, num_classes=args.num_classes)
+                loss = ce_loss + args.dice_weight * d_loss
+            else:
+                loss = ce_loss
+            
+            loss = loss / args.gradient_accumulation
+            loss.backward()
+            
+            if (batch_idx + 1) % args.gradient_accumulation == 0:
+                optimizer.step()
+                optimizer.zero_grad()
         
         # 计算评估指标
         with torch.no_grad():
             batch_dice = dice_score(outputs, masks, num_classes=args.num_classes)
         
         # 累计统计
-        total_loss += loss.item()
+        total_loss += loss.item() * args.gradient_accumulation
         total_dice += batch_dice
         
         # 更新进度条
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
+            'loss': f'{loss.item() * args.gradient_accumulation:.4f}',
             'dice': f'{batch_dice:.4f}',
             'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
         })
@@ -442,13 +466,15 @@ def main():
     print(f"  训练集: {len(train_dataset)} 样本 ({args.train_ratio * 100:.0f}%)")
     print(f"  验证集: {len(val_dataset)} 样本 ({(1 - args.train_ratio) * 100:.0f}%)")
     
-    # 创建数据加载器
+    # 创建数据加载器（优化版本）
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if args.num_workers > 0 else False,  # 保持 worker 进程存活
+        prefetch_factor=2 if args.num_workers > 0 else None  # 预取数据
     )
     
     val_loader = DataLoader(
@@ -456,7 +482,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=2 if args.num_workers > 0 else None
     )
     
     print(f"\n数据加载器:")
@@ -476,6 +504,16 @@ def main():
         base_ch=args.base_channels
     ).to(device)
     
+    # 编译模型（PyTorch 2.0+）
+    if args.compile_model:
+        try:
+            print("正在编译模型...")
+            model = torch.compile(model)
+            print("✓ 模型编译成功")
+        except Exception as e:
+            print(f"⚠ 模型编译失败: {e}")
+            print("  继续使用未编译的模型")
+    
     # 计算参数量
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -487,6 +525,10 @@ def main():
     print(f"  上采样方式: {'双线性插值' if args.bilinear else '转置卷积'}")
     print(f"  总参数量: {total_params:,}")
     print(f"  可训练参数: {trainable_params:,}")
+    if args.mixed_precision:
+        print(f"  混合精度: 启用 (FP16)")
+    if args.gradient_accumulation > 1:
+        print(f"  梯度累积: {args.gradient_accumulation} 步 (等效 batch size: {args.batch_size * args.gradient_accumulation})")
     
     # ==================== 创建损失函数 ====================
     if args.use_class_weights:
@@ -520,6 +562,12 @@ def main():
         print(f"  耐心值: {args.scheduler_patience}")
         print(f"  衰减因子: {args.scheduler_factor}")
     
+    # ==================== 混合精度训练 ====================
+    scaler = None
+    if args.mixed_precision and torch.cuda.is_available():
+        scaler = torch.cuda.amp.GradScaler()
+        print("\n✓ 混合精度训练已启用")
+    
     # ==================== 恢复训练（可选）====================
     start_epoch = 1
     best_dice = 0.0
@@ -548,7 +596,7 @@ def main():
         
         # 训练阶段
         train_loss, train_dice = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, args
+            model, train_loader, criterion, optimizer, device, epoch, args, scaler
         )
         
         # 验证阶段（每隔 validate_every 轮进行一次）
